@@ -1,17 +1,13 @@
 import torch
 import torch.nn as nn
-from torch.distributions import MultivariateNormal
 from torch.distributions import Categorical
 from torch.utils.tensorboard import SummaryWriter
-import math
-import copy
 
-################################## set device ##################################
+
 print("============================================================================================")
-# set device to cpu or cuda
-device = torch.device('cpu')
-if(torch.cuda.is_available()): 
-    device = torch.device('cuda:0') 
+device = torch.device("cpu")
+if torch.cuda.is_available():
+    device = torch.device("cuda:0")
     torch.cuda.empty_cache()
     print("Device set to : " + str(torch.cuda.get_device_name(device)))
 else:
@@ -19,279 +15,235 @@ else:
 print("============================================================================================")
 
 
-################################## PPO Policy ##################################
 class RolloutBuffer:
     def __init__(self):
-        self.actions = []
-        self.states = []
+        self.encoder_tokens = []
+        self.encoder_pad = []
+        self.encoder_segment_ids = []
+        self.decoder_tokens = []
+        self.decoder_pad = []
+        self.critic_tokens = []
+        self.critic_pad = []
+        self.target_masks = []
+
+        self.target_actions = []
+        self.speed_actions = []
         self.logprobs = []
+
         self.rewards = []
         self.state_values = []
         self.is_terminals = []
-        self.masks = []
-    
+
     def clear(self):
-        del self.actions[:]
-        del self.states[:]
-        del self.logprobs[:]
-        del self.rewards[:]
-        del self.state_values[:]
-        del self.is_terminals[:]
-        del self.masks[:]
+        self.encoder_tokens.clear()
+        self.encoder_pad.clear()
+        self.encoder_segment_ids.clear()
+        self.decoder_tokens.clear()
+        self.decoder_pad.clear()
+        self.critic_tokens.clear()
+        self.critic_pad.clear()
+        self.target_masks.clear()
+
+        self.target_actions.clear()
+        self.speed_actions.clear()
+        self.logprobs.clear()
+
+        self.rewards.clear()
+        self.state_values.clear()
+        self.is_terminals.clear()
 
 
-# class ActorCritic(nn.Module):
-#     def __init__(self, state_dim, action_dim, has_continuous_action_space, action_std_init):
-#         super(ActorCritic, self).__init__()
+class TransformerActorCritic(nn.Module):
+    def __init__(
+        self,
+        token_dim,
+        target_action_dim,
+        speed_action_dim,
+        max_encoder_len,
+        max_decoder_len,
+        max_critic_len,
+        max_other_agents=0,
+        d_model=128,
+        nhead=4,
+        num_layers=2,
+        dim_feedforward=256,
+        dropout=0.1,
+    ):
+        super().__init__()
+        self.target_action_dim = target_action_dim
+        self.speed_action_dim = speed_action_dim
+        self.max_other_agents = max(0, int(max_other_agents))
 
-#         self.has_continuous_action_space = has_continuous_action_space
-        
-#         if has_continuous_action_space:
-#             self.action_dim = action_dim
-#             self.action_var = torch.full((action_dim,), action_std_init * action_std_init).to(device)
-#         # actor
-#         if has_continuous_action_space :
-#             self.actor = nn.Sequential(
-#                             nn.Linear(state_dim, 64),
-#                             nn.Tanh(),
-#                             nn.Linear(64, 64),
-#                             nn.Tanh(),
-#                             nn.Linear(64, action_dim),
-#                             nn.Tanh()
-#                         )
-#         else:
-#             self.actor = nn.Sequential(
-#                             nn.Linear(state_dim, 64),
-#                             nn.Tanh(),
-#                             nn.Linear(64, 64),
-#                             nn.Tanh(),
-#                             nn.Linear(64, action_dim),
-#                             nn.Softmax(dim=-1)
-#                         )
-#         # critic
-#         self.critic = nn.Sequential(
-#                         nn.Linear(state_dim, 64),
-#                         nn.Tanh(),
-#                         nn.Linear(64, 64),
-#                         nn.Tanh(),
-#                         nn.Linear(64, 1)
-#                     )
-        
-#     def set_action_std(self, new_action_std):
-#         if self.has_continuous_action_space:
-#             self.action_var = torch.full((self.action_dim,), new_action_std * new_action_std).to(device)
-#         else:
-#             print("--------------------------------------------------------------------------------------------")
-#             print("WARNING : Calling ActorCritic::set_action_std() on discrete action space policy")
-#             print("--------------------------------------------------------------------------------------------")
+        self.token_proj = nn.Linear(token_dim, d_model)
 
-#     def forward(self):
-#         raise NotImplementedError
-    
-#     def act(self, state, mask=None):
+        self.encoder_pos = nn.Parameter(torch.zeros(max_encoder_len, d_model))
+        self.decoder_pos = nn.Parameter(torch.zeros(max_decoder_len, d_model))
+        self.critic_pos = nn.Parameter(torch.zeros(max_critic_len, d_model))
+        self.encoder_segment_embedding = nn.Embedding(self.max_other_agents + 1, d_model)
 
-#         action_probs = self.actor(state)
-#         dist = Categorical(action_probs)
-
-#         action = dist.sample()
-#         action_logprob = dist.log_prob(action)
-#         state_val = self.critic(state)
-
-#         return action.detach(), action_logprob.detach(), state_val.detach()
-    
-#     def act_test(self, state, mask=None):
-#         action_probs = self.actor(state)  # 假设返回动作概率分布，例如 tensor([0.2, 0.5, 0.3])
-#         max_prob_action = action_probs.argmax()  # 找到最大概率的动作索引，例如 1（对应概率 0.5）
-#         max_prob = action_probs[max_prob_action]  # 获取最大概率值，例如 0.5
-
-#         return max_prob_action
-    
-#     def evaluate(self, state, action, mask):
-#         action_probs = self.actor(state)
-#         dist = Categorical(action_probs)
-#         action_logprobs = dist.log_prob(action)
-#         dist_entropy = dist.entropy()
-#         state_values = self.critic(state)
-        
-#         return action_logprobs, state_values, dist_entropy
-
-# ! 带mask的
-class ActorCritic(nn.Module):
-    def __init__(self, state_dim, action_dim, has_continuous_action_space, action_std_init):
-        super(ActorCritic, self).__init__()
-
-        self.has_continuous_action_space = has_continuous_action_space
-        self.action_dim = action_dim
-        
-        if has_continuous_action_space:
-            self.action_var = torch.full((action_dim,), action_std_init * action_std_init).to(device)
-        # actor
-        if has_continuous_action_space:
-            self.actor = nn.Sequential(
-                nn.Linear(state_dim, 128),
-                nn.Mish(),
-                nn.Linear(128, 128),
-                nn.Mish(),
-                nn.Linear(128, action_dim),
-                nn.Mish()
-            )
-        else:
-            self.actor = nn.Sequential(
-                nn.Linear(state_dim, 128),
-                nn.Mish(),
-                nn.Linear(128, 128),
-                nn.Mish(),
-                nn.Linear(128, action_dim),
-                nn.Softmax(dim=-1)
-            )
-        # critic
-        self.critic = nn.Sequential(
-            nn.Linear(state_dim, 128),
-            nn.Mish(),
-            nn.Linear(128, 128),
-            nn.Mish(),
-            nn.Linear(128, 1)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
         )
-        
+        dec_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+        )
 
-    
-    def set_action_std(self, new_action_std):
-        if self.has_continuous_action_space:
-            self.action_var = torch.full((self.action_dim,), new_action_std * new_action_std).to(device)
-        else:
-            print("--------------------------------------------------------------------------------------------")
-            print("WARNING : Calling ActorCritic::set_action_std() on discrete action space policy")
-            print("--------------------------------------------------------------------------------------------")
+        self.actor_encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.actor_decoder = nn.TransformerDecoder(dec_layer, num_layers=num_layers)
 
-    def forward(self):
-        raise NotImplementedError
-    
-    def act(self, state, mask=None, deter_action=None):
-        """
-        Select an action during training, applying action mask if provided.
-        
-        Args:
-            state: Current state (torch tensor, shape: [batch_size, state_dim] or [state_dim])
-            mask: Action mask (torch tensor or None, shape: [action_dim]), 1 for valid, 0 for invalid
-            
-        Returns:
-            action: Selected action (scalar)
-            action_logprob: Log probability of the action
-            state_val: Critic's state value
-        """
-        action_probs = self.actor(state)
-        
-        
-            
-        if mask is not None:
-            # Ensure mask is a tensor and has correct shape
-            mask = torch.as_tensor(mask, dtype=torch.float32, device=action_probs.device)
-            if mask.shape != (self.action_dim,):
-                raise ValueError(f"Mask shape {mask.shape} does not match action_dim {self.action_dim}")
-            if mask.sum() == 0:
-                raise ValueError("Mask cannot be all zeros (no valid actions)")
-            
-            # Apply mask: set invalid action probabilities to 0
-            masked_probs = action_probs * mask
-            # Add small value to avoid zero probabilities, then normalize
-            masked_probs = masked_probs + 1e-25 * (1 - mask)
-            masked_probs = masked_probs / masked_probs.sum(dim=-1, keepdim=True)
+        self.critic_encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+
+        self.target_head = nn.Linear(d_model, target_action_dim)
+        self.speed_head = nn.Linear(d_model, speed_action_dim)
+        self.critic_head = nn.Linear(d_model, 1)
+
+    def _add_positional(self, x, pos_table):
+        return x + pos_table[: x.size(1)].unsqueeze(0)
+
+    def _last_valid(self, h, pad_mask):
+        if pad_mask is None:
+            return h[:, -1, :]
+        valid_len = (~pad_mask).long().sum(dim=1) - 1
+        valid_len = torch.clamp(valid_len, min=0)
+        batch_idx = torch.arange(h.size(0), device=h.device)
+        return h[batch_idx, valid_len, :]
+
+    def actor_forward(self, encoder_tokens, decoder_tokens, encoder_pad=None, decoder_pad=None, encoder_segment_ids=None):
+        src = self._add_positional(self.token_proj(encoder_tokens), self.encoder_pos)
+        if encoder_segment_ids is not None:
+            encoder_segment_ids = torch.clamp(encoder_segment_ids.long(), min=0, max=self.max_other_agents)
+            src = src + self.encoder_segment_embedding(encoder_segment_ids)
+        tgt = self._add_positional(self.token_proj(decoder_tokens), self.decoder_pos)
+
+        memory = self.actor_encoder(src, src_key_padding_mask=encoder_pad)
+        dec_h = self.actor_decoder(
+            tgt=tgt,
+            memory=memory,
+            tgt_key_padding_mask=decoder_pad,
+            memory_key_padding_mask=encoder_pad,
+        )
+        actor_h = self._last_valid(dec_h, decoder_pad)
+
+        target_logits = self.target_head(actor_h)
+        speed_logits = self.speed_head(actor_h)
+        return target_logits, speed_logits
+
+    def critic_forward(self, critic_tokens, critic_pad=None):
+        critic_x = self._add_positional(self.token_proj(critic_tokens), self.critic_pos)
+        critic_h = self.critic_encoder(critic_x, src_key_padding_mask=critic_pad)
+
+        if critic_pad is None:
+            pooled = critic_h.mean(dim=1)
         else:
-            masked_probs = action_probs
-        
-        # 如果指定动作，就查询指定动作的概率
+            valid = (~critic_pad).float().unsqueeze(-1)
+            denom = torch.clamp(valid.sum(dim=1), min=1.0)
+            pooled = (critic_h * valid).sum(dim=1) / denom
+        return self.critic_head(pooled)
+
+    def _masked_target_logits(self, target_logits, target_mask):
+        target_mask = torch.as_tensor(target_mask, dtype=torch.float32, device=target_logits.device)
+        if target_mask.dim() == 1:
+            target_mask = target_mask.unsqueeze(0)
+        if torch.any(target_mask.sum(dim=1) <= 0):
+            raise ValueError("Target mask cannot be all zeros.")
+        return target_logits.masked_fill(target_mask <= 0, -1e9)
+
+    def act(self, inputs, masks, deter_action=None):
+        target_logits, speed_logits = self.actor_forward(
+            inputs["encoder_tokens"],
+            inputs["decoder_tokens"],
+            inputs.get("encoder_pad"),
+            inputs.get("decoder_pad"),
+            inputs.get("encoder_segment_ids"),
+        )
+        target_logits = self._masked_target_logits(target_logits, masks["target"])
+
+        dist_target = Categorical(logits=target_logits)
+        dist_speed = Categorical(logits=speed_logits)
+
         if deter_action is not None:
-            dist = Categorical(probs=masked_probs)
-            action = torch.tensor(deter_action, dtype=torch.long).to(device)
-            action_logprob = dist.log_prob(action)
-            state_val = self.critic(state)           
+            target_action = torch.tensor([int(deter_action[0])], dtype=torch.long, device=target_logits.device)
+            speed_action = torch.tensor([int(deter_action[1])], dtype=torch.long, device=target_logits.device)
         else:
-            dist = Categorical(probs=masked_probs)
-            action = dist.sample()
-            action_logprob = dist.log_prob(action)
-            state_val = self.critic(state)
+            target_action = dist_target.sample()
+            speed_action = dist_speed.sample()
 
-        return action.detach(), action_logprob.detach(), state_val.detach()
-    
-    def act_test(self, state, mask=None):
-        """
-        Select the best action during testing, applying action mask if provided.
-        
-        Args:
-            state: Current state (torch tensor, shape: [batch_size, state_dim] or [state_dim])
-            mask: Action mask (torch tensor or None, shape: [action_dim]), 1 for valid, 0 for invalid
-            
-        Returns:
-            max_prob_action: Action with highest probability among valid actions
-        """
+        logprob = dist_target.log_prob(target_action) + dist_speed.log_prob(speed_action)
+        state_val = self.critic_forward(inputs["critic_tokens"], inputs.get("critic_pad"))
+
+        return target_action.detach(), speed_action.detach(), logprob.detach(), state_val.detach()
+
+    def act_test(self, inputs, masks):
         with torch.no_grad():
-            action_probs = self.actor(state)
-            
-            if mask is not None:
-                # Ensure mask is a tensor and has correct shape
-                mask = torch.as_tensor(mask, dtype=torch.float32, device=action_probs.device)
-                if mask.shape != (self.action_dim,):
-                    raise ValueError(f"Mask shape {mask.shape} does not match action_dim {self.action_dim}")
-                if mask.sum() == 0:
-                    raise ValueError("Mask cannot be all zeros (no valid actions)")
-                
-                # Apply mask: set invalid action probabilities to -inf
-                masked_probs = action_probs.masked_fill(mask == 0, float('-inf'))
-            else:
-                masked_probs = action_probs
-            
-            # Select action with maximum probability
-            max_prob_action = masked_probs.argmax(dim=-1)
-        
-        return max_prob_action.item()
-    
-    def evaluate(self, state, action, mask=None):
-        """
-        Evaluate actions for loss calculation, applying action mask if provided.
-        
-        Args:
-            state: States (torch tensor, shape: [batch_size, state_dim])
-            action: Actions (torch tensor, shape: [batch_size])
-            mask: Action mask (torch tensor or None, shape: [action_dim]), 1 for valid, 0 for invalid
-            
-        Returns:
-            action_logprobs: Log probabilities of actions
-            state_values: Critic's state values
-            dist_entropy: Entropy of the action distribution
-        """
-        action_probs = self.actor(state)
-        
-        if mask is not None:
-            # Ensure mask is a tensor and has correct shape
-            mask = torch.as_tensor(mask, dtype=torch.float32, device=action_probs.device)
-            # if mask.shape != (self.action_dim,):
-            #     raise ValueError(f"Mask shape {mask.shape} does not match action_dim {self.action_dim}")
-            if mask.sum() == 0:
-                raise ValueError("Mask cannot be all zeros (no valid actions)")
-            
-            # Apply mask: set invalid action probabilities to 0
-            masked_probs = action_probs * mask
-            # Add small value to avoid zero probabilities, then normalize
-            masked_probs = masked_probs + 1e-8 * (1 - mask)
-            masked_probs = masked_probs / masked_probs.sum(dim=-1, keepdim=True)
-        else:
-            masked_probs = action_probs
+            target_logits, speed_logits = self.actor_forward(
+                inputs["encoder_tokens"],
+                inputs["decoder_tokens"],
+                inputs.get("encoder_pad"),
+                inputs.get("decoder_pad"),
+                inputs.get("encoder_segment_ids"),
+            )
+            target_logits = self._masked_target_logits(target_logits, masks["target"])
 
-        dist = Categorical(probs=masked_probs)
-        action_logprobs = dist.log_prob(action)
-        dist_entropy = dist.entropy()
-        state_values = self.critic(state)
-        
+            target_action = torch.argmax(target_logits, dim=-1)
+            speed_action = torch.argmax(speed_logits, dim=-1)
+
+        return int(target_action.item()), int(speed_action.item())
+
+    def evaluate(self, inputs, target_actions, speed_actions, target_mask):
+        target_logits, speed_logits = self.actor_forward(
+            inputs["encoder_tokens"],
+            inputs["decoder_tokens"],
+            inputs.get("encoder_pad"),
+            inputs.get("decoder_pad"),
+            inputs.get("encoder_segment_ids"),
+        )
+        target_logits = self._masked_target_logits(target_logits, target_mask)
+
+        dist_target = Categorical(logits=target_logits)
+        dist_speed = Categorical(logits=speed_logits)
+
+        action_logprobs = dist_target.log_prob(target_actions) + dist_speed.log_prob(speed_actions)
+        dist_entropy = dist_target.entropy() + dist_speed.entropy()
+
+        state_values = self.critic_forward(inputs["critic_tokens"], inputs.get("critic_pad"))
         return action_logprobs, state_values, dist_entropy
 
 
 class PPO:
-    def __init__(self, agent_id, state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, has_continuous_action_space, summary_dir, entropy_ratio, gae_lambda, gae_flag, action_std_init=0.6):
-
-        self.has_continuous_action_space = has_continuous_action_space
-
-        if has_continuous_action_space:
-            self.action_std = action_std_init
+    def __init__(
+        self,
+        agent_id,
+        token_dim,
+        target_action_dim,
+        speed_action_dim,
+        max_encoder_len,
+        max_decoder_len,
+        max_critic_len,
+        max_other_agents,
+        lr_actor,
+        lr_critic,
+        gamma,
+        K_epochs,
+        eps_clip,
+        summary_dir,
+        entropy_ratio,
+        gae_lambda,
+        gae_flag,
+        d_model=128,
+        nhead=4,
+        num_layers=2,
+        dropout=0.1,
+    ):
         self.id = agent_id
         self.gamma = gamma
         self.eps_clip = eps_clip
@@ -299,263 +251,212 @@ class PPO:
         self.entropy_ratio = entropy_ratio
         self.gae_lambda = gae_lambda
         self.gae_flag = gae_flag
-        
+
         self.buffer = RolloutBuffer()
 
-        self.policy = ActorCritic(state_dim, action_dim, has_continuous_action_space, action_std_init).to(device)
-        self.optimizer = torch.optim.Adam([
-                        {'params': self.policy.actor.parameters(), 'lr': lr_actor},
-                        {'params': self.policy.critic.parameters(), 'lr': lr_critic}
-                    ])
-        
+        self.policy = TransformerActorCritic(
+            token_dim=token_dim,
+            target_action_dim=target_action_dim,
+            speed_action_dim=speed_action_dim,
+            max_encoder_len=max_encoder_len,
+            max_decoder_len=max_decoder_len,
+            max_critic_len=max_critic_len,
+            max_other_agents=max_other_agents,
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
+            dropout=dropout,
+        ).to(device)
+
+        actor_params = []
+        actor_params += list(self.policy.token_proj.parameters())
+        actor_params += list(self.policy.encoder_segment_embedding.parameters())
+        actor_params += list(self.policy.actor_encoder.parameters())
+        actor_params += list(self.policy.actor_decoder.parameters())
+        actor_params += list(self.policy.target_head.parameters())
+        actor_params += list(self.policy.speed_head.parameters())
+
+        critic_params = []
+        critic_params += list(self.policy.critic_encoder.parameters())
+        critic_params += list(self.policy.critic_head.parameters())
+
+        self.optimizer = torch.optim.Adam(
+            [
+                {"params": actor_params, "lr": lr_actor},
+                {"params": critic_params, "lr": lr_critic},
+            ]
+        )
+
+        self.policy_old = TransformerActorCritic(
+            token_dim=token_dim,
+            target_action_dim=target_action_dim,
+            speed_action_dim=speed_action_dim,
+            max_encoder_len=max_encoder_len,
+            max_decoder_len=max_decoder_len,
+            max_critic_len=max_critic_len,
+            max_other_agents=max_other_agents,
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
+            dropout=dropout,
+        ).to(device)
+        self.policy_old.load_state_dict(self.policy.state_dict())
+
+        self.MseLoss = nn.MSELoss()
+        self.update_times = 0
+
         self.summary_dir = summary_dir
         self.writer = SummaryWriter(log_dir=self.summary_dir)
 
-        self.policy_old = ActorCritic(state_dim, action_dim, has_continuous_action_space, action_std_init).to(device)
-        self.policy_old.load_state_dict(self.policy.state_dict())
-        
-        self.MseLoss = nn.MSELoss()
-        self.update_times = 0
-        self.non_bs_count = 0
-        self.bs_count = 0
-
-    def set_action_std(self, new_action_std):
-        if self.has_continuous_action_space:
-            self.action_std = new_action_std
-            self.policy.set_action_std(new_action_std)
-            self.policy_old.set_action_std(new_action_std)
+    def _to_policy_inputs(self, obs_pack):
+        encoder_tokens = torch.as_tensor(obs_pack["encoder_tokens"], dtype=torch.float32, device=device).unsqueeze(0)
+        encoder_segment_ids = obs_pack.get("encoder_segment_ids", None)
+        if encoder_segment_ids is None:
+            encoder_segment_ids = torch.zeros(
+                encoder_tokens.size(1), dtype=torch.long, device=device
+            ).unsqueeze(0)
         else:
-            print("--------------------------------------------------------------------------------------------")
-            print("WARNING : Calling PPO::set_action_std() on discrete action space policy")
-            print("--------------------------------------------------------------------------------------------")
+            encoder_segment_ids = torch.as_tensor(
+                encoder_segment_ids, dtype=torch.long, device=device
+            ).unsqueeze(0)
+        return {
+            "encoder_tokens": encoder_tokens,
+            "encoder_pad": torch.as_tensor(obs_pack["encoder_pad"], dtype=torch.bool, device=device).unsqueeze(0),
+            "encoder_segment_ids": encoder_segment_ids,
+            "decoder_tokens": torch.as_tensor(obs_pack["decoder_tokens"], dtype=torch.float32, device=device).unsqueeze(0),
+            "decoder_pad": torch.as_tensor(obs_pack["decoder_pad"], dtype=torch.bool, device=device).unsqueeze(0),
+            "critic_tokens": torch.as_tensor(obs_pack["critic_tokens"], dtype=torch.float32, device=device).unsqueeze(0),
+            "critic_pad": torch.as_tensor(obs_pack["critic_pad"], dtype=torch.bool, device=device).unsqueeze(0),
+        }
 
-    def decay_action_std(self, action_std_decay_rate, min_action_std):
-        print("--------------------------------------------------------------------------------------------")
-        if self.has_continuous_action_space:
-            self.action_std = self.action_std - action_std_decay_rate
-            self.action_std = round(self.action_std, 4)
-            if (self.action_std <= min_action_std):
-                self.action_std = min_action_std
-                print("setting actor output action_std to min_action_std : ", self.action_std)
-            else:
-                print("setting actor output action_std to : ", self.action_std)
-            self.set_action_std(self.action_std)
-
-        else:
-            print("WARNING : Calling PPO::decay_action_std() on discrete action space policy")
-        print("--------------------------------------------------------------------------------------------")
-
-    def select_action(self, state, mask, deter_action=None):
-
+    def select_action(self, obs_pack, masks, deter_action=None):
+        inputs = self._to_policy_inputs(obs_pack)
+        target_mask = torch.as_tensor(masks["target"], dtype=torch.float32, device=device).unsqueeze(0)
 
         with torch.no_grad():
-            state = torch.FloatTensor(state).to(device)
-            action, action_logprob, state_val = self.policy_old.act(state, mask, deter_action)
-        
-        self.buffer.states.append(state)
-        self.buffer.actions.append(action)
-        self.buffer.logprobs.append(action_logprob)
-        self.buffer.state_values.append(state_val)
-        
-        return action.item()
-    
-    def action_test(self, state, mask):
-        with torch.no_grad():
-            state = torch.FloatTensor(state).to(device)
-            action = self.policy_old.act_test(state, mask)
-        return action
+            target_action, speed_action, action_logprob, state_val = self.policy_old.act(
+                inputs,
+                {"target": target_mask},
+                deter_action=deter_action,
+            )
+
+        self.buffer.encoder_tokens.append(inputs["encoder_tokens"].squeeze(0).detach())
+        self.buffer.encoder_pad.append(inputs["encoder_pad"].squeeze(0).detach())
+        self.buffer.encoder_segment_ids.append(inputs["encoder_segment_ids"].squeeze(0).detach())
+        self.buffer.decoder_tokens.append(inputs["decoder_tokens"].squeeze(0).detach())
+        self.buffer.decoder_pad.append(inputs["decoder_pad"].squeeze(0).detach())
+        self.buffer.critic_tokens.append(inputs["critic_tokens"].squeeze(0).detach())
+        self.buffer.critic_pad.append(inputs["critic_pad"].squeeze(0).detach())
+        self.buffer.target_masks.append(target_mask.squeeze(0).detach())
+
+        self.buffer.target_actions.append(target_action.squeeze(0).detach())
+        self.buffer.speed_actions.append(speed_action.squeeze(0).detach())
+        self.buffer.logprobs.append(action_logprob.squeeze(0).detach())
+        self.buffer.state_values.append(state_val.squeeze(0).detach())
+
+        return int(target_action.item()), int(speed_action.item())
+
+    def action_test(self, obs_pack, masks):
+        inputs = self._to_policy_inputs(obs_pack)
+        target_mask = torch.as_tensor(masks["target"], dtype=torch.float32, device=device).unsqueeze(0)
+        return self.policy_old.act_test(inputs, {"target": target_mask})
 
     def update(self):
-        # Monte Carlo estimate of returns
-        print_reward = 0
+        if len(self.buffer.rewards) == 0:
+            return
+
         rewards = []
         discounted_reward = 0
         for reward, is_terminal in zip(reversed(self.buffer.rewards), reversed(self.buffer.is_terminals)):
             if is_terminal:
                 discounted_reward = 0
-            discounted_reward = reward + (self.gamma * discounted_reward)
-            print_reward += reward
+            discounted_reward = reward + self.gamma * discounted_reward
             rewards.insert(0, discounted_reward)
-                
-        # Normalizing the rewards
-        rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
 
-        len_batch = len(rewards)
+        rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
 
-        # convert list to tensor
-        masks = torch.squeeze(torch.stack(self.buffer.masks[:len_batch], dim=0)).detach().to(device)
-        old_states = torch.squeeze(torch.stack(self.buffer.states[:len_batch], dim=0)).detach().to(device)
-        old_actions = torch.squeeze(torch.stack(self.buffer.actions[:len_batch], dim=0)).detach().to(device)
-        old_logprobs = torch.squeeze(torch.stack(self.buffer.logprobs[:len_batch], dim=0)).detach().to(device)
-        old_state_values = torch.squeeze(torch.stack(self.buffer.state_values[:len_batch], dim=0)).detach().to(device)
+        old_inputs = {
+            "encoder_tokens": torch.stack(self.buffer.encoder_tokens, dim=0).detach().to(device),
+            "encoder_pad": torch.stack(self.buffer.encoder_pad, dim=0).detach().to(device),
+            "encoder_segment_ids": torch.stack(self.buffer.encoder_segment_ids, dim=0).detach().to(device),
+            "decoder_tokens": torch.stack(self.buffer.decoder_tokens, dim=0).detach().to(device),
+            "decoder_pad": torch.stack(self.buffer.decoder_pad, dim=0).detach().to(device),
+            "critic_tokens": torch.stack(self.buffer.critic_tokens, dim=0).detach().to(device),
+            "critic_pad": torch.stack(self.buffer.critic_pad, dim=0).detach().to(device),
+        }
 
-        # calculate advantages
+        old_target_masks = torch.stack(self.buffer.target_masks, dim=0).detach().to(device)
+        old_target_actions = torch.stack(self.buffer.target_actions, dim=0).detach().to(device)
+        old_speed_actions = torch.stack(self.buffer.speed_actions, dim=0).detach().to(device)
+        old_logprobs = torch.stack(self.buffer.logprobs, dim=0).detach().to(device)
+        old_state_values = torch.stack(self.buffer.state_values, dim=0).detach().to(device).view(-1)
+
         if self.gae_flag:
             advantages = self.compute_gae(self.buffer.rewards, old_state_values, self.buffer.is_terminals)
-            
-        else:    
-            advantages = rewards.detach() - old_state_values.detach()
+        else:
+            advantages = rewards - old_state_values
 
-        # Optimize policy for K epochs
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
         for _ in range(self.K_epochs):
+            logprobs, state_values, dist_entropy = self.policy.evaluate(
+                old_inputs,
+                old_target_actions,
+                old_speed_actions,
+                old_target_masks,
+            )
+            state_values = state_values.view(-1)
 
-            # Evaluating old actions and values
-            logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions, masks)
-
-            # match state_values tensor dimensions with rewards tensor
-            state_values = torch.squeeze(state_values)
-            
-            # Finding the ratio (pi_theta / pi_theta__old)
-            ratios = torch.exp(logprobs - old_logprobs.detach())
-
-            # Finding Surrogate Loss  
+            ratios = torch.exp(logprobs - old_logprobs)
             surr1 = ratios * advantages
-            surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * advantages
+            surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
 
-            # final loss of clipped objective PPO
             policy_loss = -torch.min(surr1, surr2).mean()
-            critic_loss = self.MseLoss(state_values, rewards).mean()
+            critic_loss = self.MseLoss(state_values, rewards)
             entropy_loss = dist_entropy.mean()
-            loss = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(state_values, rewards) - self.entropy_ratio * dist_entropy
-            
-            # 记录
-            if self.id == 0:
-                self.writer.add_scalar('loss/policy', policy_loss.detach().item(),self.update_times)
-                self.writer.add_scalar('loss/critic', critic_loss.detach().item(),self.update_times)
-                
-                self.writer.add_scalar('stats/critic', state_values.mean(), self.update_times)
-                self.writer.add_scalar('stats/entropy', entropy_loss.detach().item(), self.update_times)
-                
-                self.writer.add_scalar('reward/train', print_reward, self.update_times)
-            
-            
-            # take gradient step
-            self.optimizer.zero_grad()
-            loss.mean().backward()
-            self.optimizer.step()
-            
-            self.update_times += 1
-            
-        # Copy new weights into old policy
-        self.policy_old.load_state_dict(self.policy.state_dict())
+            loss = policy_loss + 0.5 * critic_loss - self.entropy_ratio * entropy_loss
 
-        # clear buffer
+            if self.id == 0:
+                self.writer.add_scalar("loss/policy", policy_loss.detach().item(), self.update_times)
+                self.writer.add_scalar("loss/critic", critic_loss.detach().item(), self.update_times)
+                self.writer.add_scalar("stats/critic", state_values.mean().detach().item(), self.update_times)
+                self.writer.add_scalar("stats/entropy", entropy_loss.detach().item(), self.update_times)
+                self.writer.add_scalar("reward/train", float(sum(self.buffer.rewards)), self.update_times)
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
+            self.optimizer.step()
+
+            self.update_times += 1
+
+        self.policy_old.load_state_dict(self.policy.state_dict())
         self.buffer.clear()
-     
+
     def compute_gae(self, rewards, state_values, is_terminals):
-        """
-        Compute Generalized Advantage Estimation (GAE).
-        
-        Args:
-            rewards: List or tensor of rewards.
-            state_values: Tensor of state value estimates V(s_t).
-            next_state_value: Value estimate of the last state V(s_{T+1}).
-            is_terminals: List or tensor indicating terminal states.
-        
-        Returns:
-            advantages: Tensor of GAE advantages.
-        """
-        gae = 0
-        advantages = []
-        rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
-        is_terminals = torch.tensor(is_terminals, dtype=torch.float32).to(device)
-        state_values = torch.squeeze(state_values).detach()
-        # state_values = torch.cat([state_values, torch.tensor([0.0], dtype=torch.float32, device=state_values.device)])
-        
+        rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
+        dones = torch.tensor(is_terminals, dtype=torch.float32, device=device)
+        values = state_values.detach()
+
+        advantages = torch.zeros_like(rewards)
+        gae = torch.tensor(0.0, dtype=torch.float32, device=device)
+        next_value = torch.tensor(0.0, dtype=torch.float32, device=device)
+
         for t in reversed(range(len(rewards))):
-            
-            # print(is_terminals[t], self.id)
-            
-            if is_terminals[t]:
-                delta = rewards[t] - state_values[t]
-                gae = delta
-            else:
-            # delta = rewards[t] + self.gamma*state_values[t + 1] - state_values[t]
-                delta = rewards[t] + self.gamma * (t < len(rewards) - 1)*state_values[t + 1] - state_values[t]
-                gae = delta + self.gamma * self.gae_lambda * gae
-            advantages.insert(0, gae)
-        
-        advantages = torch.tensor(advantages, dtype=torch.float32).to(device)
+            mask = 1.0 - dones[t]
+            delta = rewards[t] + self.gamma * next_value * mask - values[t]
+            gae = delta + self.gamma * self.gae_lambda * mask * gae
+            advantages[t] = gae
+            next_value = values[t]
+
         return advantages
-    
+
     def save(self, checkpoint_path):
         torch.save(self.policy_old.state_dict(), checkpoint_path)
-   
+
     def load(self, checkpoint_path):
         self.policy_old.load_state_dict(torch.load(checkpoint_path, map_location=lambda storage, loc: storage))
         self.policy.load_state_dict(torch.load(checkpoint_path, map_location=lambda storage, loc: storage))
-        
+
     def call_2_record(self, steps, value):
-        self.writer.add_scalar('reward/test', value, steps)
-    
-    
-    # !A3C
-    # def update(self) :
-    #     # Monte Carlo estimate of returns
-    #     print_reward = 0
-        
-    #     # 这里开始复制
-    #     rewards = copy.copy(self.buffer.rewards)
-    #     len_batch = len(rewards)
-    #     values = copy.copy(self.buffer.state_values[:len(rewards)])
-    #     rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
-        
-    #     # A3C式更新
-    #     R = torch.zeros(1, 1).to(device)
-    #     values.append(R)
-    #     values = torch.tensor(values).to(device)
-        
-        
-    #     masks = torch.squeeze(torch.stack(self.buffer.masks[:len_batch], dim=0)).detach().to(device)
-    #     old_states = torch.squeeze(torch.stack(self.buffer.states[:len_batch], dim=0)).detach().to(device)
-    #     old_actions = torch.squeeze(torch.stack(self.buffer.actions[:len_batch], dim=0)).detach().to(device)
-    #     logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions, masks)
-    #     state_values = state_values.view(-1)
-        
-        
-        
-    #     policy_loss = 0
-    #     value_loss = 0
-    #     entropy_loss = 0
-    #     gae = torch.zeros(1, 1).to(device)
-    #     for i in reversed(range(len(rewards))):
-    #         R = self.gamma * R + rewards[i]
-    #         advantage = R - state_values[i]
-    #         value_loss = value_loss + 0.5 * advantage.pow(2)
-
-    #         # Generalized Advantage Estimation
-    #         delta_t = rewards[i] + self.gamma * \
-    #             values[i + 1] - values[i]
-    #         gae = gae * self.gamma * self.gae_lambda + delta_t
-    #         policy_loss = policy_loss - logprobs[i] * gae.detach()
-    #         entropy_loss = entropy_loss - self.entropy_ratio * dist_entropy[i]
-    #         print_reward += rewards[i]
-        
-    #     # 记录
-    #     if self.id == 0:
-    #         self.writer.add_scalar('loss/policy', policy_loss.detach().item(),self.update_times)
-    #         self.writer.add_scalar('loss/critic', value_loss.detach().item(),self.update_times)
-            
-    #         self.writer.add_scalar('stats/critic', state_values.mean(), self.update_times)
-    #         self.writer.add_scalar('stats/entropy', entropy_loss.detach().item(), self.update_times)
-            
-    #         self.writer.add_scalar('reward/train', print_reward, self.update_times)
-            
-            
-    #     # take gradient step
-    #     self.optimizer.zero_grad()
-    #     (policy_loss + 0.5 * value_loss + entropy_loss).backward()
-    #     self.optimizer.step()
-        
-    #     self.update_times += 1
-            
-    #     # Copy new weights into old policy
-    #     self.policy_old.load_state_dict(self.policy.state_dict())
-
-    #     # clear buffer
-    #     self.buffer.clear()
-        
-        
-       
-
-
+        self.writer.add_scalar("reward/test", value, steps)

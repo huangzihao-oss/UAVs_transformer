@@ -8,6 +8,23 @@ import os
 from matplotlib import cm
 
 
+def UAV_Energy(v):
+    P_b = 79.86
+    P_i = 88.63
+    V_tip = 120
+    u_0 = 4.03
+    f_0 = 0.6
+    a = 1.225
+    n = 0.05
+    R = 0.503
+    energy = (
+        P_b * (1 + (3 * v * v) / (V_tip * V_tip))
+        + P_i * np.sqrt(np.sqrt(1 + (v * v * v * v) / (4 * (u_0**4))) - v * v / (2 * u_0 * u_0))
+        + f_0 * a * n * R * v * v * v / 2
+    )
+    return float(energy)
+
+
 class MultiDroneAoIEnv(gym.Env):
     def __init__(
         self,
@@ -50,6 +67,11 @@ class MultiDroneAoIEnv(gym.Env):
 
         # 无人机速度（支持异构性）
         self.drone_speeds = drone_speeds if drone_speeds is not None else [1.0] * M
+        self.speed_levels = self._parse_speed_levels()
+        self.speed_action_dim = len(self.speed_levels)
+        self.default_speed_idx = int(np.argmax(self.speed_levels))
+        self.nominal_speed = float(np.mean(self.speed_levels))
+        self.init_uav_energy = float(getattr(self.args, "init_uav_energy", 2.0e5))
         # ! 看如何计算
         self.sense_times = sense_times if sense_times is not None else [1.0] * K
 
@@ -69,7 +91,7 @@ class MultiDroneAoIEnv(gym.Env):
         self.aoi = np.zeros(K)
         self.global_timing = 0
         # !后期需要进行修改
-        self.fly_speed = 15
+        self.fly_speed = self.nominal_speed
         self.drone_last_visited_history_at_BS = np.zeros((M, K))
         self.drone_visited_history_timing_at_BS = np.zeros((M, K))
         # self.drone_last_decision_at_BS = np.zeros(M)
@@ -87,17 +109,25 @@ class MultiDroneAoIEnv(gym.Env):
         self.drone_step_reward = [[] for i in range(M)]
         self.drone_position_now = np.zeros((self.M, 2))
         self.other_drones_delay_rewards = [[] for i in range(M)]
-        # self.drone_last_rest_energy = np.zeros(M)
+        self.drone_energy_now = np.ones(M, dtype=np.float32) * self.init_uav_energy
         
         # !观测和动作空间
-        # 动作空间：单个无人机
+        # 动作空间：目标点（POI/BS） + 速度档位
         self.action_space = spaces.Discrete(K + N)
+        self.speed_action_space = spaces.Discrete(self.speed_action_dim)
+        self.target_action_dim = K + N
         # 观测空间：单个无人机
-        # obs_dim = K+(M+N+K)*2+K+1+M*K+M+1
-        obs_dim = K+K+K+1+K+1+K*M+M+1
+        # obs_dim = K + K + K + 1 + K + 1 + K*M + M + 1 + 1(energy)
+        obs_dim = K + K + K + 1 + K + 1 + K * M + M + 1 + 1
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
         )
+        self.token_dim = obs_dim + 2
+        self.history_horizon = int(getattr(self.args, "history_horizon", 10))
+        self.max_other_agents = max(0, self.M - 1)
+        self.encoder_token_len = max(1, (self.M - 1) * self.history_horizon)
+        self.decoder_token_len = max(1, self.history_horizon + 1)  # +1 for current state token
+        self.critic_token_len = max(1, self.M * (self.history_horizon + 1))
         
         self.left = 4
         self.right = 8
@@ -128,7 +158,177 @@ class MultiDroneAoIEnv(gym.Env):
         self.drone_step_reward = [[] for i in range(self.M)]
         self.drone_position_now = np.zeros((self.M, 2))
         self.other_drones_delay_rewards = [[] for i in range(self.M)]
+        self.drone_energy_now = np.ones(self.M, dtype=np.float32) * self.init_uav_energy
+        self.local_transition_tokens = [[] for _ in range(self.M)]
+        self.bs_uploaded_tokens = [[] for _ in range(self.M)]
+        self.synced_other_tokens = [[[] for _ in range(self.M)] for _ in range(self.M)]
+        self.bs_uploaded_versions = np.zeros(self.M, dtype=np.int64)
+        self.bs_uploaded_times = np.full(self.M, -np.inf, dtype=np.float32)
+        self.downloaded_versions = np.zeros((self.M, self.M), dtype=np.int64)
+        self.downloaded_times = np.full((self.M, self.M), -np.inf, dtype=np.float32)
+        self.bs_reward_logs = [[] for _ in range(self.M)]  # (version, reward_scaled, upload_time)
+        self.downloaded_reward_versions = np.zeros((self.M, self.M), dtype=np.int64)
         return self._get_obs(0)
+
+    def _parse_speed_levels(self):
+        raw = getattr(self.args, "speed_levels", "6-20")
+        if isinstance(raw, str):
+            raw = raw.strip()
+            if "-" in raw and "," not in raw:
+                # 支持区间格式: "6-20" 或 "6-20:1"
+                if ":" in raw:
+                    range_part, step_part = raw.split(":", 1)
+                    step = max(float(step_part.strip()), 1e-3)
+                else:
+                    range_part = raw
+                    step = 1.0
+                low_s, high_s = [v.strip() for v in range_part.split("-", 1)]
+                low_v = float(low_s)
+                high_v = float(high_s)
+                if high_v < low_v:
+                    low_v, high_v = high_v, low_v
+                speeds = list(np.arange(low_v, high_v + 1e-9, step))
+            else:
+                parts = [p.strip() for p in raw.split(",") if p.strip()]
+                speeds = [float(p) for p in parts] if parts else [15.0]
+        elif isinstance(raw, (list, tuple, np.ndarray)):
+            speeds = [float(v) for v in raw]
+        else:
+            speeds = list(np.arange(6.0, 20.0 + 1e-9, 1.0))
+        speeds = [max(1e-3, s) for s in speeds]
+        return np.array(sorted(speeds), dtype=np.float32)
+
+    def _parse_action(self, action):
+        if isinstance(action, (tuple, list, np.ndarray)):
+            target_action = int(action[0])
+            speed_idx = int(action[1]) if len(action) > 1 else self.default_speed_idx
+        else:
+            target_action = int(action)
+            speed_idx = self.default_speed_idx
+
+        speed_idx = int(np.clip(speed_idx, 0, self.speed_action_dim - 1))
+        speed = float(self.speed_levels[speed_idx])
+        return target_action, speed_idx, speed
+
+    def _compose_transition_token(self, state_vec, target_action, speed_idx, reward):
+        combined_action = target_action * self.speed_action_dim + speed_idx
+        denom = max(1, self.target_action_dim * self.speed_action_dim - 1)
+        action_norm = float(combined_action / denom)
+        token = np.concatenate([state_vec, np.array([action_norm, reward], dtype=np.float32)])
+        return token.astype(np.float32)
+
+    def _pad_tokens(self, token_list, seq_len):
+        seq = np.zeros((seq_len, self.token_dim), dtype=np.float32)
+        pad_mask = np.ones(seq_len, dtype=np.bool_)
+        if len(token_list) == 0:
+            return seq, pad_mask
+
+        tail = token_list[-seq_len:]
+        start = seq_len - len(tail)
+        seq[start:] = np.array(tail, dtype=np.float32)
+        pad_mask[start:] = False
+        return seq, pad_mask
+
+    def _sync_with_bs(self, uav_id, own_reward_scaled):
+        # UAV uploads its newest local history to BS, BS version increments.
+        self.bs_uploaded_tokens[uav_id] = [tok.copy() for tok in self.local_transition_tokens[uav_id]]
+        self.bs_uploaded_versions[uav_id] += 1
+        self.bs_uploaded_times[uav_id] = self.drone_timing_now[uav_id]
+        curr_version = int(self.bs_uploaded_versions[uav_id])
+        self.bs_reward_logs[uav_id].append(
+            (curr_version, float(own_reward_scaled), float(self.drone_timing_now[uav_id]))
+        )
+
+        # Downloader can only refresh others' histories at BS.
+        # Only newer BS versions are downloaded, avoiding stale overwrite.
+        for other_id in range(self.M):
+            if other_id == uav_id:
+                continue
+            latest_version = self.bs_uploaded_versions[other_id]
+            if latest_version > self.downloaded_versions[uav_id, other_id]:
+                self.synced_other_tokens[uav_id][other_id] = [
+                    tok.copy() for tok in self.bs_uploaded_tokens[other_id]
+                ]
+                self.downloaded_versions[uav_id, other_id] = latest_version
+                self.downloaded_times[uav_id, other_id] = self.drone_timing_now[uav_id]
+
+    def _collect_pending_coop_rewards(self, uav_id):
+        coop_reward = 0.0
+        for other_id in range(self.M):
+            if other_id == uav_id:
+                continue
+            last_downloaded = int(self.downloaded_reward_versions[uav_id, other_id])
+            latest_version = int(self.bs_uploaded_versions[other_id])
+            if latest_version <= last_downloaded:
+                continue
+
+            for version, reward_scaled, _ in self.bs_reward_logs[other_id]:
+                if last_downloaded < version <= latest_version:
+                    coop_reward += float(reward_scaled)
+            self.downloaded_reward_versions[uav_id, other_id] = latest_version
+        return coop_reward
+
+    def _build_segmented_encoder_tokens(self, uav_id):
+        tokens = np.zeros((self.encoder_token_len, self.token_dim), dtype=np.float32)
+        pad = np.ones(self.encoder_token_len, dtype=np.bool_)
+        segment_ids = np.zeros(self.encoder_token_len, dtype=np.int64)
+
+        if self.max_other_agents == 0:
+            return tokens, pad, segment_ids
+
+        other_ids = [idx for idx in range(self.M) if idx != uav_id]
+        for seg_idx, other_id in enumerate(other_ids, start=1):
+            seg_start = (seg_idx - 1) * self.history_horizon
+            seg_end = seg_start + self.history_horizon
+            seg_history = self.synced_other_tokens[uav_id][other_id][-self.history_horizon:]
+            if len(seg_history) == 0:
+                continue
+
+            fill_start = seg_end - len(seg_history)
+            tokens[fill_start:seg_end] = np.array(seg_history, dtype=np.float32)
+            pad[fill_start:seg_end] = False
+            segment_ids[fill_start:seg_end] = seg_idx
+
+        return tokens, pad, segment_ids
+
+    def get_action_masks(self, uav_id):
+        target_mask = np.ones(self.target_action_dim, dtype=np.float32)
+        target_mask[self.drone_buffer[uav_id]] = 0.0
+        if len(self.drone_buffer[uav_id]) == 0:
+            target_mask[self.K:self.K + self.N] = 0.0
+        speed_mask = np.ones(self.speed_action_dim, dtype=np.float32)
+        return {"target": target_mask, "speed": speed_mask}
+
+    def get_transformer_inputs(self, uav_id):
+        current_obs = self._get_obs(uav_id).astype(np.float32)
+        current_token = self._compose_transition_token(
+            current_obs, target_action=0, speed_idx=0, reward=0.0
+        )
+
+        decoder_tokens_raw = list(self.local_transition_tokens[uav_id]) + [current_token]
+        decoder_tokens, decoder_pad = self._pad_tokens(decoder_tokens_raw, self.decoder_token_len)
+
+        encoder_tokens, encoder_pad, encoder_segment_ids = self._build_segmented_encoder_tokens(uav_id)
+
+        critic_tokens_raw = []
+        for agent_id in range(self.M):
+            agent_obs = self._get_obs(agent_id).astype(np.float32)
+            critic_tokens_raw.extend(self.local_transition_tokens[agent_id][-self.history_horizon:])
+            critic_tokens_raw.append(
+                self._compose_transition_token(agent_obs, target_action=0, speed_idx=0, reward=0.0)
+            )
+        critic_tokens, critic_pad = self._pad_tokens(critic_tokens_raw, self.critic_token_len)
+
+        return {
+            "encoder_tokens": encoder_tokens,
+            "encoder_pad": encoder_pad,
+            "encoder_segment_ids": encoder_segment_ids,
+            "decoder_tokens": decoder_tokens,
+            "decoder_pad": decoder_pad,
+            "critic_tokens": critic_tokens,
+            "critic_pad": critic_pad,
+            "obs": current_obs,
+        }
 
     def _get_obs(self, uav_id):
         """获取指定无人机的观测"""
@@ -181,10 +381,23 @@ class MultiDroneAoIEnv(gym.Env):
         
         # *缓存大小
         buffer_len = np.array([len(self.drone_step_reward[uav_id])])
+        # *剩余能量（归一化）
+        energy_obs = np.array([self.drone_energy_now[uav_id] / max(self.init_uav_energy, 1e-6)], dtype=np.float32)
         
-        # !注意需要进行归一化 K+K+K+1+K+1+K*M+M+1
+        # !注意需要进行归一化 K+K+K+1+K+1+K*M+M+1+1
         # print(aoi_obs, dis_2_pois/500)
-        return np.concatenate([aoi_obs, dis_2_pois/500, rewards_2_pois, rewards_2_bs, buffer_obs, time_obs, history_visited_sensors_and_timing, self.drone_last_reward/self.args.reward_scale_size, buffer_len])
+        return np.concatenate([
+            aoi_obs,
+            dis_2_pois / 500,
+            rewards_2_pois,
+            rewards_2_bs,
+            buffer_obs,
+            time_obs,
+            history_visited_sensors_and_timing,
+            self.drone_last_reward / self.args.reward_scale_size,
+            buffer_len,
+            energy_obs,
+        ])
 
     def step(self, uav_id, action):
         """
@@ -201,131 +414,159 @@ class MultiDroneAoIEnv(gym.Env):
             info (dict): 包含drone_id、avg_aoi、current_time等
         """
         assert 0 <= uav_id < self.M, f"Invalid uav_id: {uav_id}"
-        assert self.action_space.contains(action), f"Invalid action: {action}"
-        
+        target_action, speed_idx, selected_speed = self._parse_action(action)
+        assert self.action_space.contains(target_action), f"Invalid target action: {target_action}"
+        is_bs_action = self.K <= target_action <= self.K + self.N - 1
+
+        state_before = self._get_obs(uav_id).astype(np.float32)
+
         # K是感知点
         # N是基站
         # *如果是基站
-        if self.K <= action <= self.K+self.N-1:
-            target_position = self.base_pos[action-self.K]
+        if is_bs_action:
+            target_position = self.base_pos[target_action - self.K]
             move_dis = euclidean(target_position, self.drone_position_now[uav_id])
-            move_time = move_dis/self.fly_speed
-            
+            move_time = move_dis / selected_speed
+
             # 根据计算结果更新（位置、时间）
             self.drone_position_now[uav_id] = target_position
             self.drone_timing_now[uav_id] += move_time
-            
+
             for i in range(self.K):
                 self.drone_local_aoi[uav_id, i] += move_time
                 self.aoi[i] += self.drone_timing_now[uav_id] - self.global_timing
-            
+
             self.global_timing = self.drone_timing_now[uav_id]
-            
+
             reward = 0
             if self.drone_buffer[uav_id]:
                 for i in range(len(self.drone_buffer[uav_id])):
                     coll_timing = self.buffer_timing[uav_id][i]
                     target_poi = self.drone_buffer[uav_id][i]
                     curr_aoi = self.drone_timing_now[uav_id] - coll_timing
-                    
-                    reward += max((min(self.aoi[target_poi], self.drone_local_aoi[uav_id, target_poi]) - curr_aoi), 0)*(self.T - self.drone_timing_now[uav_id])/2
+
+                    reward += max(
+                        (min(self.aoi[target_poi], self.drone_local_aoi[uav_id, target_poi]) - curr_aoi), 0
+                    ) * (self.T - self.drone_timing_now[uav_id]) / 2
                     self.aoi[target_poi] = min(curr_aoi, self.aoi[target_poi])
-                
+
                 self.drone_local_aoi[uav_id] = self.aoi
                 self.drone_visited_history_timing_at_BS[uav_id] = np.zeros(self.K)
                 for i in range(len(self.drone_buffer[uav_id])):
                     self.drone_visited_history_timing_at_BS[uav_id, self.drone_buffer[uav_id][i]] = self.buffer_timing[uav_id][i]
-                
+
                 # 这一轮总的reward
                 self.drone_last_reward[uav_id] = reward
-                
+
                 # 将自己当前的总奖励分给其他uav
                 for i in range(self.M):
                     if i != uav_id:
                         self.other_drones_delay_rewards[i].append(reward)
-                
+
                 # 首先减去之前为了鼓励无人机飞行而产生的reward
                 # 清空自己之前的reward记录，进行下一轮收集
                 step_reward = np.array(self.drone_step_reward[uav_id])
-                negative_reward_indx = np.argwhere(step_reward<=0)
+                negative_reward_indx = np.argwhere(step_reward <= 0)
                 step_reward[negative_reward_indx] *= -1
                 reward -= sum(step_reward)
-                
-                # reward -= sum(self.drone_step_reward[uav_id])
+
                 self.drone_step_reward[uav_id] = []
-                
-                # delay rewards
-                # !获取这段时间内其他人的reward，清空队列
-                # reward += sum(self.other_drones_delay_rewards[uav_id])
                 self.other_drones_delay_rewards[uav_id] = []
-                
+
                 # 清空buffer
                 self.drone_buffer[uav_id] = []
                 self.buffer_timing[uav_id] = []
-                
+
         # *如果不是基站，只需要维护自己的内容，不知道别人的内容
         else:
-            target_poi = action
+            target_poi = target_action
             target_position = self.sensor_pos[target_poi]
             move_dis = euclidean(target_position, self.drone_position_now[uav_id])
-            move_time = move_dis/self.fly_speed
-            
+            move_time = move_dis / selected_speed
+
             self.drone_timing_now[uav_id] += move_time
             self.drone_buffer[uav_id].append(target_poi)
             self.buffer_timing[uav_id].append(self.drone_timing_now[uav_id])
             self.drone_position_now[uav_id] = target_position
-            
+
             for i in range(self.K):
                 self.drone_local_aoi[uav_id, i] += move_time
-                        
-            # !起始这里没有处理好总时间的关系！
+
             # *三分之一的reward
-            reward = self.drone_local_aoi[uav_id, target_poi]*(self.T - self.drone_timing_now[uav_id])/(2*self.args.pre_reward_ratio)
-            if self.args.buffer_punishment:
-                if len(self.drone_step_reward[uav_id]) >= self.bs_random_factor:
-                    reward = -self.args.punishment_value*self.args.reward_scale_size
-                    
+            reward = self.drone_local_aoi[uav_id, target_poi] * (self.T - self.drone_timing_now[uav_id]) / (2 * self.args.pre_reward_ratio)
+            if self.args.buffer_punishment and len(self.drone_step_reward[uav_id]) >= self.bs_random_factor:
+                reward = -self.args.punishment_value * self.args.reward_scale_size
+
             self.drone_step_reward[uav_id].append(reward)
-        
-        done = False
-        # !能量或者时间很少的时候，也可以为True
-        if self.drone_timing_now[uav_id] >= self.T:
-            done = True
-        
-        # !之后加上mask
-        info = np.ones(self.K+self.N)
-        info[self.drone_buffer[uav_id]] = 0
-        
-        if len(self.drone_buffer[uav_id]) == 0:
-            info[self.K:self.K+self.N] = 0
-        
+
+        # 动作完成后更新能量：能耗功率 * 飞行时长
+        energy_cost = UAV_Energy(selected_speed) * move_time
+        self.drone_energy_now[uav_id] -= energy_cost
+        self.drone_energy_now[uav_id] = max(self.drone_energy_now[uav_id], 0.0)
+
+        done = (self.drone_timing_now[uav_id] >= self.T) or (self.drone_energy_now[uav_id] <= 0)
+
         # 注意时间超出时的波动很大
         if self.drone_timing_now[uav_id] > self.T:
             reward = 0
-        
+
+        reward_scaled = reward / self.args.reward_scale_size
+        if is_bs_action:
+            # 先上传自己的本次BS结算奖励，再领取其他无人机未领取的BS奖励（合作奖励）
+            self._sync_with_bs(uav_id, own_reward_scaled=reward_scaled)
+            coop_reward = self._collect_pending_coop_rewards(uav_id)
+            reward_scaled += coop_reward
+        transition_token = self._compose_transition_token(
+            state_before, target_action=target_action, speed_idx=speed_idx, reward=reward_scaled
+        )
+        self.local_transition_tokens[uav_id].append(transition_token)
+
+        info = self.get_action_masks(uav_id)
+        obs = self._get_obs(uav_id)
+
         if self.args.print_info:
-            print("Action UAV: {}, action: {}, time now: {}, time cost: {}, local AoI: {}, position: {}, buffer: {}".format(uav_id, action, self.drone_timing_now[uav_id], move_time, self.drone_local_aoi[uav_id], self.drone_position_now[uav_id],self.drone_buffer[uav_id]))
-                    
-        return  self._get_obs(uav_id), reward/self.args.reward_scale_size, done, info
+            print(
+                "Action UAV: {}, action: ({}, {}), speed: {:.2f}, time now: {}, time cost: {}, local AoI: {}, position: {}, buffer: {}".format(
+                    uav_id,
+                    target_action,
+                    speed_idx,
+                    selected_speed,
+                    self.drone_timing_now[uav_id],
+                    move_time,
+                    self.drone_local_aoi[uav_id],
+                    self.drone_position_now[uav_id],
+                    self.drone_buffer[uav_id],
+                )
+            )
+            print(
+                "UAV {} energy: {:.2f}/{:.2f}, energy_cost: {:.2f}".format(
+                    uav_id,
+                    self.drone_energy_now[uav_id],
+                    self.init_uav_energy,
+                    energy_cost,
+                )
+            )
+
+        return obs, reward_scaled, done, info
 
     def time_cost(self, uav_id, action):
-        if self.K <= action <= self.K+self.N-1:
-            # print(action-self.K)
-            target_position = self.base_pos[action-self.K]
+        target_action, _, selected_speed = self._parse_action(action)
+        if self.K <= target_action <= self.K + self.N - 1:
+            target_position = self.base_pos[target_action - self.K]
             move_dis = euclidean(target_position, self.drone_position_now[uav_id])
-            move_time = move_dis/self.fly_speed
+            move_time = move_dis / selected_speed
         else:
-            target_poi = action
-            # print(target_poi)
+            target_poi = target_action
             target_position = self.sensor_pos[target_poi]
             move_dis = euclidean(target_position, self.drone_position_now[uav_id])
-            move_time = move_dis/self.fly_speed
+            move_time = move_dis / selected_speed
         return move_time
 
     def render(self, mode="human"):
         """渲染环境"""
         print(f"Time: {self.global_timing:.2f}/{self.T}")
         print(f"Average AoI: {np.mean(self.aoi):.2f}")
+        print("Drone Energy:", self.drone_energy_now)
         print("Drone Positions:", self.drone_pos)
         print("Drone Buffers:", self.drone_buffer)
         print("Drone Visit History:", self.buffer_timing)
@@ -337,7 +578,8 @@ class MultiDroneAoIEnv(gym.Env):
         
     def get_pos(self, action):
         all_positions = np.concatenate([self.sensor_pos, self.base_pos], axis=0)
-        return all_positions[action]
+        target_action, _, _ = self._parse_action(action)
+        return all_positions[target_action]
         
     def visualize_routes(self, test_actions, output_dir="output", dpi=300, file="", nums=10):
         """
