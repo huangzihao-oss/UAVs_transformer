@@ -21,7 +21,8 @@ def parse_args():
 
     # PPO hyperparameters
     parser.add_argument("--update_timestep", type=int, default=None, help="Policy update frequency")
-    parser.add_argument("--K_epochs", type=int, default=10, help="Number of PPO epochs")
+    parser.add_argument("--K_epochs", type=int, default=5, help="Number of PPO epochs")
+    parser.add_argument("--update_every_episodes", type=int, default=2, help="Update PPO every N episodes")
     parser.add_argument("--eps_clip", type=float, default=0.2, help="Clip parameter for PPO")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     parser.add_argument("--lr_actor", type=float, default=0.0001, help="Learning rate for actor")
@@ -48,14 +49,16 @@ def parse_args():
     parser.add_argument("--M", type=int, default=2, help="Num of UAVs")
     parser.add_argument("--N", type=int, default=1, help="Num of Bases")
     parser.add_argument("--K", type=int, default=20, help="Num of PoIs")
+    parser.add_argument("--position_file", type=str, default=None, help="Path to .npy map file")
     parser.add_argument("--T", type=int, default=1800, help="Time limits")
     parser.add_argument("--BS_back_times", type=int, default=5, help="Buffer threshold for return-to-BS penalty")
     parser.add_argument("--map_size", type=int, default=1000, help="Map size")
     parser.add_argument("--init_uav_energy", type=float, default=3.0e5, help="Initial energy budget per UAV")
-    parser.add_argument("--pre_reward_ratio", type=float, default=4.0, help="Ratio of pre reward")
+    parser.add_argument("--pre_reward_ratio", type=float, default=3.0, help="Ratio of pre reward")
     parser.add_argument("--buffer_punishment", action="store_true", help="Enable buffer punishment")
     parser.add_argument("--punishment_value", type=float, default=4.0, help="Punishment scale")
     parser.add_argument("--reward_scale_size", type=float, default=10000.0, help="Reward scale")
+    parser.add_argument("--reward_divisor", type=float, default=10.0, help="Additional reward divisor")
     parser.add_argument("--print_info", action="store_true", help="Print env step details")
 
     args = parser.parse_args()
@@ -85,7 +88,9 @@ def train():
 
     tensorboard_dir = os.path.join("logs", env_name)
 
-    env = MultiDroneAoIEnv(args.M, args.N, args.K, args.T, args.map_size, args=args)
+    env = MultiDroneAoIEnv(
+        args.M, args.N, args.K, args.T, args.map_size, args=args, position_file=args.position_file
+    )
 
     token_dim = env.token_dim
     target_action_dim = env.target_action_dim
@@ -150,6 +155,19 @@ def train():
 
     time_step = 0
     i_episode = 0
+    episodes_since_update = 0
+    speed_segment_step = 0
+
+    def log_avg_speed_segment():
+        speed_values = []
+        for agent in ppo_agent:
+            for speed_idx in agent.buffer.speed_actions:
+                idx = int(speed_idx.item()) if hasattr(speed_idx, "item") else int(speed_idx)
+                idx = int(np.clip(idx, 0, speed_action_dim - 1))
+                speed_values.append(float(env.speed_levels[idx]))
+        if len(speed_values) == 0:
+            return None
+        return float(np.mean(speed_values))
 
     while time_step <= max_training_timesteps:
         env.reset()
@@ -179,12 +197,12 @@ def train():
 
                     if non_base_count < 100:
                         uav_actions_queue[i] = ppo_agent[i].select_action(obs_pack, mask_pack)
-                        if uav_actions_queue[i][0] < args.K:
+                        if uav_actions_queue[i][0] < env.K:
                             non_base_count += 1
                         else:
                             non_base_count = 0
                     else:
-                        forced_action = (args.K + args.N - 1, env.default_speed_idx)
+                        forced_action = (env.K + env.N - 1, env.default_speed_idx)
                         uav_actions_queue[i] = ppo_agent[i].select_action(
                             obs_pack, mask_pack, deter_action=forced_action
                         )
@@ -221,16 +239,13 @@ def train():
                 values = [i_episode]
                 rewards_sum = 0
                 for idx, agent in enumerate(ppo_agent, 1):
-                    agent_reward = sum(agent.buffer.rewards)
+                    agent_reward = current_ep_reward[idx - 1]
                     format_string += ", Agent {} len: {}, rewards {}: {}"
-                    values.extend([idx, len(agent.buffer.rewards), idx, agent_reward])
+                    values.extend([idx, len(agent.buffer.rewards), idx, round(agent_reward, 6)])
                     rewards_sum += agent_reward
                 format_string += " Sum of rewards: {}"
-                values.append(rewards_sum)
+                values.append(round(rewards_sum, 6))
                 print(format_string.format(*values))
-
-                for i in range(args.M):
-                    ppo_agent[i].update()
                 break
 
             if time_step % log_freq == 0 and log_running_episodes > 0:
@@ -274,6 +289,16 @@ def train():
         log_running_episodes += 1
 
         i_episode += 1
+        episodes_since_update += 1
+
+        if episodes_since_update >= max(1, args.update_every_episodes):
+            avg_speed_segment = log_avg_speed_segment()
+            if avg_speed_segment is not None:
+                ppo_agent[0].writer.add_scalar("stats/avg_speed_segment", avg_speed_segment, speed_segment_step)
+                speed_segment_step += 1
+            for i in range(args.M):
+                ppo_agent[i].update()
+            episodes_since_update = 0
 
         if i_episode % 10 == 0:
             env.reset()
@@ -286,7 +311,8 @@ def train():
             test_rewards = [0.0] * args.M
             test_positions = [[] for _ in range(args.M)]
 
-            finish_step = 400
+            finish_step = max_ep_len
+            test_logged = False
             for _ in range(1, finish_step + 1):
                 candidate_times = np.full(args.M, np.inf, dtype=np.float32)
 
@@ -316,9 +342,23 @@ def train():
                     done_bool[action_uav] = 1
 
                 if done_tag == args.M:
-                    ppo_agent[0].call_2_record(i_episode // 10, test_rewards[0])
+                    ppo_agent[0].call_2_record(i_episode // 10, float(sum(test_rewards)))
                     env.visualize_routes(test_positions, "./test_figs")
+                    test_logged = True
                     break
+
+            # 即使测试没有在finish_step内全部结束，也记录当前累计团队测试奖励
+            if not test_logged:
+                ppo_agent[0].call_2_record(i_episode // 10, float(sum(test_rewards)))
+
+    # 训练结束前，若未到更新周期，仍执行一次更新，避免缓冲区样本丢失
+    if episodes_since_update > 0:
+        avg_speed_segment = log_avg_speed_segment()
+        if avg_speed_segment is not None:
+            ppo_agent[0].writer.add_scalar("stats/avg_speed_segment", avg_speed_segment, speed_segment_step)
+            speed_segment_step += 1
+        for i in range(args.M):
+            ppo_agent[i].update()
 
     log_f.close()
     env.close()
@@ -331,5 +371,5 @@ def train():
     print("============================================================================================")
 
 
-if __name__ == "__main__":
-    train()
+# if __name__ == "__main__":
+train()

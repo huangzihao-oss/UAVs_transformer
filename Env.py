@@ -3,6 +3,8 @@ import numpy as np
 from gym import spaces
 from scipy.spatial.distance import euclidean
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import os
 from matplotlib import cm
@@ -72,28 +74,51 @@ class MultiDroneAoIEnv(gym.Env):
         self.default_speed_idx = int(np.argmax(self.speed_levels))
         self.nominal_speed = float(np.mean(self.speed_levels))
         self.init_uav_energy = float(getattr(self.args, "init_uav_energy", 2.0e5))
-        # ! 看如何计算
-        self.sense_times = sense_times if sense_times is not None else [1.0] * K
-
+        self.reward_divisor = float(getattr(self.args, "reward_divisor", 10.0))
         # 位置：无人机、基站、感知点
         self.drone_pos = np.zeros((M, 2))  # 初始位置 (0, 0)
-        self.base_pos = np.zeros((N, 2))
-        self.sensor_pos = np.zeros((K, 2))
-        
-        # !数据文件
-        position_filename = f"./data/poi_{self.K}_bs_{self.N}_map_{int(self.map_size)}x{int(self.map_size)}.npy"
+        self.base_pos = np.zeros((self.N, 2))
+        self.sensor_pos = np.zeros((self.K, 2))
+
+        # !数据文件：支持指定位置文件，并读取 poi 权重
+        position_filename = position_file or getattr(self.args, "position_file", None)
+        if position_filename is None:
+            new_name = f"./data/poi_{self.K}_map_{int(self.map_size)}x{int(self.map_size)}.npy"
+            old_name = f"./data/poi_{self.K}_bs_{self.N}_map_{int(self.map_size)}x{int(self.map_size)}.npy"
+            position_filename = new_name if os.path.exists(new_name) else old_name
         data = np.load(position_filename, allow_pickle=True).item()
-        self.sensor_pos = data['poi_positions']
-        self.base_pos = data['bs_positions']
+        self.sensor_pos = np.asarray(data["poi_positions"], dtype=np.float32)
+        self.base_pos = np.asarray(data["bs_positions"], dtype=np.float32)
+        self.K = int(self.sensor_pos.shape[0])
+        self.N = int(self.base_pos.shape[0])
+
+        raw_weights = data.get("poi_weights", None)
+        if raw_weights is None:
+            self.poi_weights = np.ones(self.K, dtype=np.float32)
+        else:
+            self.poi_weights = np.asarray(raw_weights, dtype=np.float32).reshape(-1)
+            if self.poi_weights.shape[0] != self.K:
+                raise ValueError(
+                    f"poi_weights length {self.poi_weights.shape[0]} does not match K={self.K} in {position_filename}"
+                )
+        self.weight_norm = max(float(np.max(self.poi_weights)), 1e-6)
+
+        # ! 看如何计算
+        if sense_times is None:
+            self.sense_times = [1.0] * self.K
+        else:
+            if len(sense_times) != self.K:
+                raise ValueError(f"sense_times length {len(sense_times)} must match K={self.K}")
+            self.sense_times = sense_times
 
         # !全局信息
         # 信息年龄 (AoI)
-        self.aoi = np.zeros(K)
+        self.aoi = np.zeros(self.K)
         self.global_timing = 0
         # !后期需要进行修改
         self.fly_speed = self.nominal_speed
-        self.drone_last_visited_history_at_BS = np.zeros((M, K))
-        self.drone_visited_history_timing_at_BS = np.zeros((M, K))
+        self.drone_last_visited_history_at_BS = np.zeros((M, self.K))
+        self.drone_visited_history_timing_at_BS = np.zeros((M, self.K))
         # self.drone_last_decision_at_BS = np.zeros(M)
         # self.drone_last_decision_time_at_BS = np.zeros(M)
         
@@ -104,7 +129,7 @@ class MultiDroneAoIEnv(gym.Env):
         self.buffer_timing = [[] for _ in range(M)]
         # 每个无人机单独的时间
         self.drone_timing_now = np.zeros(M)
-        self.drone_local_aoi = np.zeros((M, K))
+        self.drone_local_aoi = np.zeros((M, self.K))
         self.drone_last_reward = np.zeros(M)
         self.drone_step_reward = [[] for i in range(M)]
         self.drone_position_now = np.zeros((self.M, 2))
@@ -113,12 +138,14 @@ class MultiDroneAoIEnv(gym.Env):
         
         # !观测和动作空间
         # 动作空间：目标点（POI/BS） + 速度档位
-        self.action_space = spaces.Discrete(K + N)
+        self.action_space = spaces.Discrete(self.K + self.N)
         self.speed_action_space = spaces.Discrete(self.speed_action_dim)
-        self.target_action_dim = K + N
+        self.target_action_dim = self.K + self.N
         # 观测空间：单个无人机
-        # obs_dim = K + K + K + 1 + K + 1 + K*M + M + 1 + 1(energy)
-        obs_dim = K + K + K + 1 + K + 1 + K * M + M + 1 + 1
+        # obs_dim = AoI(K) + distance(K) + weighted_est_reward(K) + reward2bs(1)
+        #         + buffer(K) + time(1) + bs_history(K*M) + last_reward(M)
+        #         + buffer_len(1) + energy(1) + poi_weight(K)
+        obs_dim = self.K + self.K + self.K + 1 + self.K + 1 + self.K * M + M + 1 + 1 + self.K
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
         )
@@ -214,8 +241,32 @@ class MultiDroneAoIEnv(gym.Env):
         combined_action = target_action * self.speed_action_dim + speed_idx
         denom = max(1, self.target_action_dim * self.speed_action_dim - 1)
         action_norm = float(combined_action / denom)
-        token = np.concatenate([state_vec, np.array([action_norm, reward], dtype=np.float32)])
+        return self._compose_state_prev_token(state_vec, action_norm, reward)
+
+    def _compose_state_prev_token(self, state_vec, prev_action, prev_reward):
+        token = np.concatenate([state_vec, np.array([prev_action, prev_reward], dtype=np.float32)])
         return token.astype(np.float32)
+
+    def _build_prev_aligned_tokens(self, sar_tokens):
+        """
+        将历史 [s_t, a_t, r_t] 转为 [s_t, a_{t-1}, r_{t-1}]。
+        第一个token没有上一步动作和奖励，用 -1 填充。
+        """
+        aligned = []
+        prev_action = -1.0
+        prev_reward = -1.0
+        for sar in sar_tokens:
+            state_vec = np.array(sar[:-2], dtype=np.float32)
+            aligned.append(self._compose_state_prev_token(state_vec, prev_action, prev_reward))
+            prev_action = float(sar[-2])
+            prev_reward = float(sar[-1])
+        return aligned
+
+    def _get_last_action_reward(self, sar_tokens):
+        if len(sar_tokens) == 0:
+            return -1.0, -1.0
+        last = sar_tokens[-1]
+        return float(last[-2]), float(last[-1])
 
     def _pad_tokens(self, token_list, seq_len):
         seq = np.zeros((seq_len, self.token_dim), dtype=np.float32)
@@ -280,7 +331,8 @@ class MultiDroneAoIEnv(gym.Env):
         for seg_idx, other_id in enumerate(other_ids, start=1):
             seg_start = (seg_idx - 1) * self.history_horizon
             seg_end = seg_start + self.history_horizon
-            seg_history = self.synced_other_tokens[uav_id][other_id][-self.history_horizon:]
+            other_aligned = self._build_prev_aligned_tokens(self.synced_other_tokens[uav_id][other_id])
+            seg_history = other_aligned[-self.history_horizon:]
             if len(seg_history) == 0:
                 continue
 
@@ -288,6 +340,14 @@ class MultiDroneAoIEnv(gym.Env):
             tokens[fill_start:seg_end] = np.array(seg_history, dtype=np.float32)
             pad[fill_start:seg_end] = False
             segment_ids[fill_start:seg_end] = seg_idx
+
+        # 防止 encoder 全padding导致 Transformer 注意力出现 NaN
+        if np.all(pad):
+            tokens[-1] = self._compose_state_prev_token(
+                np.zeros(self.observation_space.shape[0], dtype=np.float32), -1.0, -1.0
+            )
+            pad[-1] = False
+            segment_ids[-1] = 0
 
         return tokens, pad, segment_ids
 
@@ -301,11 +361,11 @@ class MultiDroneAoIEnv(gym.Env):
 
     def get_transformer_inputs(self, uav_id):
         current_obs = self._get_obs(uav_id).astype(np.float32)
-        current_token = self._compose_transition_token(
-            current_obs, target_action=0, speed_idx=0, reward=0.0
-        )
+        prev_action, prev_reward = self._get_last_action_reward(self.local_transition_tokens[uav_id])
+        current_token = self._compose_state_prev_token(current_obs, prev_action, prev_reward)
 
-        decoder_tokens_raw = list(self.local_transition_tokens[uav_id]) + [current_token]
+        self_aligned = self._build_prev_aligned_tokens(self.local_transition_tokens[uav_id])
+        decoder_tokens_raw = self_aligned + [current_token]
         decoder_tokens, decoder_pad = self._pad_tokens(decoder_tokens_raw, self.decoder_token_len)
 
         encoder_tokens, encoder_pad, encoder_segment_ids = self._build_segmented_encoder_tokens(uav_id)
@@ -313,10 +373,10 @@ class MultiDroneAoIEnv(gym.Env):
         critic_tokens_raw = []
         for agent_id in range(self.M):
             agent_obs = self._get_obs(agent_id).astype(np.float32)
-            critic_tokens_raw.extend(self.local_transition_tokens[agent_id][-self.history_horizon:])
-            critic_tokens_raw.append(
-                self._compose_transition_token(agent_obs, target_action=0, speed_idx=0, reward=0.0)
-            )
+            agent_aligned = self._build_prev_aligned_tokens(self.local_transition_tokens[agent_id])
+            critic_tokens_raw.extend(agent_aligned[-self.history_horizon:])
+            agent_prev_action, agent_prev_reward = self._get_last_action_reward(self.local_transition_tokens[agent_id])
+            critic_tokens_raw.append(self._compose_state_prev_token(agent_obs, agent_prev_action, agent_prev_reward))
         critic_tokens, critic_pad = self._pad_tokens(critic_tokens_raw, self.critic_token_len)
 
         return {
@@ -345,7 +405,8 @@ class MultiDroneAoIEnv(gym.Env):
         mask = np.ones(self.K)
         mask[self.drone_buffer[uav_id]] = 0
         rewards_2_pois = next_aoi_2_poi * (self.T-next_time_2_poi)/(2*self.args.pre_reward_ratio)*mask
-        rewards_2_pois /= self.args.reward_scale_size
+        rewards_2_pois *= self.poi_weights
+        rewards_2_pois /= (self.args.reward_scale_size * self.reward_divisor)
         
         # 转换为效率，rewards/time
         rewards_2_pois *= 60
@@ -357,9 +418,9 @@ class MultiDroneAoIEnv(gym.Env):
             target_poi = self.drone_buffer[uav_id][i]
             curr_aoi = self.drone_timing_now[uav_id] - coll_timing
             
-            rewards_2_bs += (self.drone_local_aoi[uav_id, target_poi] - curr_aoi)*(self.T - self.drone_timing_now[uav_id])/2
+            rewards_2_bs += self.poi_weights[target_poi] * (self.drone_local_aoi[uav_id, target_poi] - curr_aoi) * (self.T - self.drone_timing_now[uav_id]) / 2
         rewards_2_bs -= sum(self.drone_step_reward[uav_id])
-        rewards_2_bs = np.array([rewards_2_bs])*5/self.args.reward_scale_size
+        rewards_2_bs = np.array([rewards_2_bs]) * 5 / (self.args.reward_scale_size * self.reward_divisor)
         
         
         
@@ -383,6 +444,8 @@ class MultiDroneAoIEnv(gym.Env):
         buffer_len = np.array([len(self.drone_step_reward[uav_id])])
         # *剩余能量（归一化）
         energy_obs = np.array([self.drone_energy_now[uav_id] / max(self.init_uav_energy, 1e-6)], dtype=np.float32)
+        # *poi权重（归一化）
+        poi_weight_obs = self.poi_weights / self.weight_norm
         
         # !注意需要进行归一化 K+K+K+1+K+1+K*M+M+1+1
         # print(aoi_obs, dis_2_pois/500)
@@ -394,9 +457,10 @@ class MultiDroneAoIEnv(gym.Env):
             buffer_obs,
             time_obs,
             history_visited_sensors_and_timing,
-            self.drone_last_reward / self.args.reward_scale_size,
+            self.drone_last_reward / (self.args.reward_scale_size * self.reward_divisor),
             buffer_len,
             energy_obs,
+            poi_weight_obs,
         ])
 
     def step(self, uav_id, action):
@@ -445,7 +509,7 @@ class MultiDroneAoIEnv(gym.Env):
                     target_poi = self.drone_buffer[uav_id][i]
                     curr_aoi = self.drone_timing_now[uav_id] - coll_timing
 
-                    reward += max(
+                    reward += self.poi_weights[target_poi] * max(
                         (min(self.aoi[target_poi], self.drone_local_aoi[uav_id, target_poi]) - curr_aoi), 0
                     ) * (self.T - self.drone_timing_now[uav_id]) / 2
                     self.aoi[target_poi] = min(curr_aoi, self.aoi[target_poi])
@@ -493,7 +557,7 @@ class MultiDroneAoIEnv(gym.Env):
                 self.drone_local_aoi[uav_id, i] += move_time
 
             # *三分之一的reward
-            reward = self.drone_local_aoi[uav_id, target_poi] * (self.T - self.drone_timing_now[uav_id]) / (2 * self.args.pre_reward_ratio)
+            reward = self.poi_weights[target_poi] * self.drone_local_aoi[uav_id, target_poi] * (self.T - self.drone_timing_now[uav_id]) / (2 * self.args.pre_reward_ratio)
             if self.args.buffer_punishment and len(self.drone_step_reward[uav_id]) >= self.bs_random_factor:
                 reward = -self.args.punishment_value * self.args.reward_scale_size
 
@@ -510,7 +574,7 @@ class MultiDroneAoIEnv(gym.Env):
         if self.drone_timing_now[uav_id] > self.T:
             reward = 0
 
-        reward_scaled = reward / self.args.reward_scale_size
+        reward_scaled = reward / (self.args.reward_scale_size * self.reward_divisor)
         if is_bs_action:
             # 先上传自己的本次BS结算奖励，再领取其他无人机未领取的BS奖励（合作奖励）
             self._sync_with_bs(uav_id, own_reward_scaled=reward_scaled)
@@ -581,7 +645,7 @@ class MultiDroneAoIEnv(gym.Env):
         target_action, _, _ = self._parse_action(action)
         return all_positions[target_action]
         
-    def visualize_routes(self, test_actions, output_dir="output", dpi=300, file="", nums=10):
+    def visualize_routes(self, test_actions, output_dir="output", dpi=150, file="", nums=10):
         """
         Visualize POI positions, base station positions, and UAV routes (first 10 steps).
         
@@ -614,10 +678,8 @@ class MultiDroneAoIEnv(gym.Env):
         map_width = x_max - x_min
         map_height = y_max - y_min
 
-        # Create figure
-        plt.cla()
-        plt.clf()
-        plt.figure(figsize=(8, 8))
+        # Create figure (non-interactive backend + explicit close avoids GDI/bitmap leak on Windows)
+        fig = plt.figure(figsize=(8, 8))
 
         # Plot POIs (blue circles)
         if n_poi > 0:
@@ -657,3 +719,4 @@ class MultiDroneAoIEnv(gym.Env):
         filename = file + f"poi_{n_poi}_bs_{n_bs}_map_{int(map_width)}x{int(map_height)}_uav_routes.png"
         filepath = os.path.join(output_dir, filename)
         plt.savefig(filepath, dpi=dpi, bbox_inches='tight')
+        plt.close(fig)

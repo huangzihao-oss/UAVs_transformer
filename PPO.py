@@ -124,6 +124,8 @@ class TransformerActorCritic(nn.Module):
             encoder_segment_ids = torch.clamp(encoder_segment_ids.long(), min=0, max=self.max_other_agents)
             src = src + self.encoder_segment_embedding(encoder_segment_ids)
         tgt = self._add_positional(self.token_proj(decoder_tokens), self.decoder_pos)
+        src = torch.nan_to_num(src, nan=0.0, posinf=1e4, neginf=-1e4)
+        tgt = torch.nan_to_num(tgt, nan=0.0, posinf=1e4, neginf=-1e4)
 
         memory = self.actor_encoder(src, src_key_padding_mask=encoder_pad)
         dec_h = self.actor_decoder(
@@ -136,10 +138,13 @@ class TransformerActorCritic(nn.Module):
 
         target_logits = self.target_head(actor_h)
         speed_logits = self.speed_head(actor_h)
+        target_logits = torch.nan_to_num(target_logits, nan=0.0, posinf=1e4, neginf=-1e4)
+        speed_logits = torch.nan_to_num(speed_logits, nan=0.0, posinf=1e4, neginf=-1e4)
         return target_logits, speed_logits
 
     def critic_forward(self, critic_tokens, critic_pad=None):
         critic_x = self._add_positional(self.token_proj(critic_tokens), self.critic_pos)
+        critic_x = torch.nan_to_num(critic_x, nan=0.0, posinf=1e4, neginf=-1e4)
         critic_h = self.critic_encoder(critic_x, src_key_padding_mask=critic_pad)
 
         if critic_pad is None:
@@ -148,7 +153,9 @@ class TransformerActorCritic(nn.Module):
             valid = (~critic_pad).float().unsqueeze(-1)
             denom = torch.clamp(valid.sum(dim=1), min=1.0)
             pooled = (critic_h * valid).sum(dim=1) / denom
-        return self.critic_head(pooled)
+        pooled = torch.nan_to_num(pooled, nan=0.0, posinf=1e4, neginf=-1e4)
+        value = self.critic_head(pooled)
+        return torch.nan_to_num(value, nan=0.0, posinf=1e4, neginf=-1e4)
 
     def _masked_target_logits(self, target_logits, target_mask):
         target_mask = torch.as_tensor(target_mask, dtype=torch.float32, device=target_logits.device)
@@ -319,13 +326,18 @@ class PPO:
             encoder_segment_ids = torch.as_tensor(
                 encoder_segment_ids, dtype=torch.long, device=device
             ).unsqueeze(0)
+        encoder_tokens = torch.nan_to_num(encoder_tokens, nan=0.0, posinf=1e4, neginf=-1e4)
+        decoder_tokens = torch.as_tensor(obs_pack["decoder_tokens"], dtype=torch.float32, device=device).unsqueeze(0)
+        decoder_tokens = torch.nan_to_num(decoder_tokens, nan=0.0, posinf=1e4, neginf=-1e4)
+        critic_tokens = torch.as_tensor(obs_pack["critic_tokens"], dtype=torch.float32, device=device).unsqueeze(0)
+        critic_tokens = torch.nan_to_num(critic_tokens, nan=0.0, posinf=1e4, neginf=-1e4)
         return {
             "encoder_tokens": encoder_tokens,
             "encoder_pad": torch.as_tensor(obs_pack["encoder_pad"], dtype=torch.bool, device=device).unsqueeze(0),
             "encoder_segment_ids": encoder_segment_ids,
-            "decoder_tokens": torch.as_tensor(obs_pack["decoder_tokens"], dtype=torch.float32, device=device).unsqueeze(0),
+            "decoder_tokens": decoder_tokens,
             "decoder_pad": torch.as_tensor(obs_pack["decoder_pad"], dtype=torch.bool, device=device).unsqueeze(0),
-            "critic_tokens": torch.as_tensor(obs_pack["critic_tokens"], dtype=torch.float32, device=device).unsqueeze(0),
+            "critic_tokens": critic_tokens,
             "critic_pad": torch.as_tensor(obs_pack["critic_pad"], dtype=torch.bool, device=device).unsqueeze(0),
         }
 
@@ -359,7 +371,12 @@ class PPO:
     def action_test(self, obs_pack, masks):
         inputs = self._to_policy_inputs(obs_pack)
         target_mask = torch.as_tensor(masks["target"], dtype=torch.float32, device=device).unsqueeze(0)
-        return self.policy_old.act_test(inputs, {"target": target_mask})
+        was_training = self.policy_old.training
+        self.policy_old.eval()
+        action = self.policy_old.act_test(inputs, {"target": target_mask})
+        if was_training:
+            self.policy_old.train()
+        return action
 
     def update(self):
         if len(self.buffer.rewards) == 0:
